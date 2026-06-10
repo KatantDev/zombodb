@@ -42,7 +42,8 @@ pub struct InnerHit {
 
 #[derive(Debug, Deserialize)]
 pub struct Hits {
-    total: HitsTotal,
+    // absent when the search was made with track_total_hits=false
+    total: Option<HitsTotal>,
     hits: Option<Vec<InnerHit>>,
 }
 
@@ -156,6 +157,12 @@ impl ElasticsearchSearchRequest {
         url.push_str("&_source=false");
         if single_page_size.is_none() {
             url.push_str("&scroll=5s");
+        } else {
+            // a single-page top-N search doesn't need the total hit count.
+            // not computing it also lets Lucene skip non-competitive blocks
+            // entirely (block-max WAND), which can dramatically reduce the
+            // CPU cost of broad scored queries
+            url.push_str("&track_total_hits=false");
         }
         url.push_str("&stored_fields=_none_");
 
@@ -452,7 +459,11 @@ impl ElasticsearchSearchResponse {
 
     pub fn len(&self) -> usize {
         match self.hits.as_ref() {
-            Some(hits) => hits.total.value as usize,
+            Some(hits) => hits
+                .total
+                .as_ref()
+                .map(|total| total.value as usize)
+                .unwrap_or(0),
             None => 0,
         }
     }
@@ -731,6 +742,23 @@ impl IntoIterator for ElasticsearchSearchResponse {
 #[pgrx::pg_schema]
 mod tests {
     use pgrx::*;
+
+    #[test]
+    fn test_response_without_total_hits_deserializes() {
+        // with track_total_hits=false Elasticsearch omits hits.total from
+        // the response entirely -- parsing must not fail
+        let json = r#"{
+            "_shards": { "total": 1, "successful": 1, "skipped": 0, "failed": 0 },
+            "hits": {
+                "hits": [
+                    { "_score": 1.0, "fields": { "zdb_ctid": [42] } }
+                ]
+            }
+        }"#;
+        let response: super::ElasticsearchSearchResponse =
+            serde_json::from_str(json).expect("response without hits.total must deserialize");
+        assert_eq!(response.len(), 0, "without total tracking, len() is zero");
+    }
 
     /// how many scroll requests has Elasticsearch served for this index?
     /// (per-index stats, so concurrently-running tests can't interfere)
