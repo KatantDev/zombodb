@@ -132,12 +132,31 @@ impl ElasticsearchSearchRequest {
         extra_fields: Option<Vec<&str>>,
     ) -> std::result::Result<ElasticsearchSearchResponse, ElasticsearchError> {
         let mut should_sort_hits = false;
+
+        // will the entire result set fit in a single page?  if so, there's no
+        // need to involve the scroll API at all: that saves two extra HTTP
+        // round-trips (the empty follow-up scroll and the scroll cleanup) and
+        // Elasticsearch never has to allocate a search context.
+        //
+        // the page must cover limit+offset rows as the offset is applied
+        // client-side while iterating
+        let max_result_window = elasticsearch.options.max_result_window() as u64;
+        let single_page_size = match query.limit() {
+            Some(limit) if limit > 0 && limit <= max_result_window => {
+                let effective = limit.saturating_add(query.offset().unwrap_or(0));
+                (effective <= max_result_window).then_some(effective)
+            }
+            _ => None,
+        };
+
         let mut url = String::new();
         url.push_str(&elasticsearch.base_url());
         url.push_str("/_search");
         url.push_str("?search_type=query_then_fetch");
         url.push_str("&_source=false");
-        url.push_str("&scroll=5s");
+        if single_page_size.is_none() {
+            url.push_str("&scroll=5s");
+        }
         url.push_str("&stored_fields=_none_");
 
         // we always want the zdb_ctid field
@@ -184,8 +203,14 @@ impl ElasticsearchSearchRequest {
                     fast_terms: None,
                 });
             }
-            Some(limit) if limit <= elasticsearch.options.max_result_window() as u64 => {
-                url.push_str(&format!("&size={}", limit));
+            Some(limit) if limit <= max_result_window => {
+                match single_page_size {
+                    // the whole limit+offset fits in one page
+                    Some(size) => url.push_str(&format!("&size={}", size)),
+                    // the limit fits but a large offset pushes us past the
+                    // result window, so scroll through full-sized pages
+                    None => url.push_str(&format!("&size={}", max_result_window)),
+                }
                 // if we don't already have a sort_json, create one to
                 // order by _score desc
                 if sort_json.is_none() {
@@ -193,10 +218,7 @@ impl ElasticsearchSearchRequest {
                 }
             }
             _ => {
-                url.push_str(&format!(
-                    "&size={}",
-                    elasticsearch.options.max_result_window()
-                ));
+                url.push_str(&format!("&size={}", max_result_window));
             }
         }
 
@@ -454,6 +476,23 @@ impl Scroller {
         let (sender, receiver) = std::sync::mpsc::channel();
         let terminate_arc = Arc::new(AtomicBool::new(false));
 
+        if orig_scroll_id.is_none() {
+            // no scroll was started (single-page response), so there's
+            // nothing to fetch in the background and nothing to clean up
+            drop(sender);
+            return Scroller {
+                receiver,
+                current_hits: Some({
+                    if should_sort_hits {
+                        Scroller::sort_hits(&mut initial_hits);
+                    }
+                    initial_hits.into_iter()
+                }),
+                terminate: terminate_arc,
+                should_sort_hits,
+            };
+        }
+
         // spawn a thread to continually get the next scroll chunk from Elasticsearch
         // until there's no more to get
         let mut scroll_id = orig_scroll_id.clone();
@@ -692,6 +731,135 @@ impl IntoIterator for ElasticsearchSearchResponse {
 #[pgrx::pg_schema]
 mod tests {
     use pgrx::*;
+
+    /// how many scroll requests has Elasticsearch served for this index?
+    /// (per-index stats, so concurrently-running tests can't interfere)
+    fn index_scroll_total(index: &str) -> i64 {
+        let response = Spi::get_one::<String>(&format!(
+            "SELECT zdb.request('{index}', '_stats/search')"
+        ))
+        .expect("failed to get index stats")
+        .expect("index stats response was NULL");
+        let json: serde_json::Value =
+            serde_json::from_str(&response).expect("invalid _stats json");
+        json["_all"]["total"]["search"]["scroll_total"]
+            .as_i64()
+            .expect("no scroll_total in _stats response")
+    }
+
+    /// ZomboDB's scroll requests come from a background thread, so wait for
+    /// the counter to settle before trusting it
+    fn settled_scroll_total(index: &str) -> i64 {
+        let mut previous = index_scroll_total(index);
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let current = index_scroll_total(index);
+            if current == previous {
+                return current;
+            }
+            previous = current;
+        }
+        previous
+    }
+
+    fn collect_i64(sql: &str) -> Vec<i64> {
+        Spi::connect(|client| {
+            let mut table = client.select(sql, None, &[])?;
+            let mut out = Vec::new();
+            while table.next().is_some() {
+                out.push(table.get_one::<i64>()?.expect("value was NULL"));
+            }
+            Ok::<_, spi::Error>(out)
+        })
+        .expect("query failed")
+    }
+
+    #[pg_test]
+    #[initialize(es = true)]
+    fn test_limited_search_opens_no_scroll() -> spi::Result<()> {
+        Spi::run("CREATE TABLE test_noscroll AS SELECT * FROM generate_series(1, 100);")?;
+        Spi::run("CREATE INDEX idxtest_noscroll ON test_noscroll USING zombodb ((test_noscroll.*));")?;
+
+        let before = index_scroll_total("idxtest_noscroll");
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM test_noscroll WHERE test_noscroll ==> dsl.limit(10, dsl.match_all());",
+        )?
+        .expect("SPI datum was NULL");
+        assert_eq!(count, 10);
+        let after = settled_scroll_total("idxtest_noscroll");
+
+        assert_eq!(
+            after - before,
+            0,
+            "a single-page limited search must not use the scroll API"
+        );
+        Ok(())
+    }
+
+    #[pg_test]
+    #[initialize(es = true)]
+    fn test_limited_search_with_offset_opens_no_scroll() -> spi::Result<()> {
+        Spi::run("CREATE TABLE test_noscroll_off AS SELECT * FROM generate_series(1, 100);")?;
+        Spi::run(
+            "CREATE INDEX idxtest_noscroll_off ON test_noscroll_off USING zombodb ((test_noscroll_off.*));",
+        )?;
+
+        let before = index_scroll_total("idxtest_noscroll_off");
+        let values = collect_i64(
+            "SELECT * FROM test_noscroll_off WHERE test_noscroll_off ==> \
+             dsl.sort('generate_series', 'asc', dsl.offset_limit(3, 5, dsl.match_all()));",
+        );
+        let after = settled_scroll_total("idxtest_noscroll_off");
+
+        // offset is applied client-side, so ES must return limit+offset rows
+        assert_eq!(values, vec![4, 5, 6, 7, 8]);
+        assert_eq!(
+            after - before,
+            0,
+            "limit+offset within a single page must not use the scroll API"
+        );
+        Ok(())
+    }
+
+    #[pg_test]
+    #[initialize(es = true)]
+    fn test_offset_limit_tail() -> spi::Result<()> {
+        Spi::run("CREATE TABLE test_offlim_tail AS SELECT * FROM generate_series(1, 100);")?;
+        Spi::run(
+            "CREATE INDEX idxtest_offlim_tail ON test_offlim_tail USING zombodb ((test_offlim_tail.*));",
+        )?;
+
+        // offset+limit reaching past the end of the result set
+        let values = collect_i64(
+            "SELECT * FROM test_offlim_tail WHERE test_offlim_tail ==> \
+             dsl.sort('generate_series', 'asc', dsl.offset_limit(95, 10, dsl.match_all()));",
+        );
+        assert_eq!(values, vec![96, 97, 98, 99, 100]);
+        Ok(())
+    }
+
+    #[pg_test]
+    #[initialize(es = true)]
+    fn test_unlimited_search_still_scrolls() -> spi::Result<()> {
+        Spi::run("CREATE TABLE test_yesscroll AS SELECT * FROM generate_series(1, 10001);")?;
+        Spi::run(
+            "CREATE INDEX idxtest_yesscroll ON test_yesscroll USING zombodb ((test_yesscroll.*));",
+        )?;
+
+        let before = index_scroll_total("idxtest_yesscroll");
+        let count = Spi::get_one::<i64>(
+            "SELECT count(*) FROM test_yesscroll WHERE test_yesscroll ==> dsl.match_all();",
+        )?
+        .expect("SPI datum was NULL");
+        assert_eq!(count, 10001);
+        let after = settled_scroll_total("idxtest_yesscroll");
+
+        assert!(
+            after - before > 0,
+            "multi-page unlimited searches must still use the scroll API"
+        );
+        Ok(())
+    }
 
     #[pg_test]
     #[initialize(es = true)]
