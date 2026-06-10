@@ -230,6 +230,7 @@ impl PgHooks for ZDBHooks {
         ) -> HookResult<*mut pg_sys::PlannedStmt>,
     ) -> HookResult<*mut pg_sys::PlannedStmt> {
         PlanWalker::new().perform(&parse);
+        crate::walker::topn::perform(&parse);
         let result = prev_hook(parse, query_string, cursor_options, bound_params);
 
         unsafe {

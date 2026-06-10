@@ -1,6 +1,8 @@
 use crate::utils::lookup_function;
 use pgrx::*;
 
+pub mod topn;
+
 pub struct PlanWalker {
     zdbquery_oid: pg_sys::Oid,
     zdb_score_oid: pg_sys::Oid,

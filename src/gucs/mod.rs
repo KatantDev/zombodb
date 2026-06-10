@@ -38,6 +38,18 @@ impl ZDBLogLevel {
     }
 }
 
+/// Controls automatic "top-N by score" pushdown.  See `src/walker/topn.rs`
+#[allow(non_camel_case_types)]
+#[derive(PostgresGucEnum, Clone, Copy, PartialEq, Debug)]
+pub enum ScoreTopNPushdown {
+    /// feature disabled
+    off,
+    /// pushdown only when `zdb.score(..) DESC` is the *only* ORDER BY key
+    strict,
+    /// pushdown when `zdb.score(..) DESC` is the *first* ORDER BY key
+    primary,
+}
+
 pub static ZDB_IGNORE_VISIBILITY: GucSetting<bool> = GucSetting::<bool>::new(false);
 pub static ZDB_DEFAULT_ROW_ESTIMATE: GucSetting<i32> = GucSetting::<i32>::new(2500);
 pub static ZDB_DEFAULT_REPLICAS: GucSetting<i32> = GucSetting::<i32>::new(0);
@@ -46,6 +58,8 @@ pub static ZDB_DEFAULT_ELASTICSEARCH_URL: GucSetting<Option<&'static CStr>> =
 pub static ZDB_LOG_LEVEL: GucSetting<ZDBLogLevel> =
     GucSetting::<ZDBLogLevel>::new(ZDBLogLevel::Debug);
 pub static ZDB_ACCELERATOR: GucSetting<bool> = GucSetting::<bool>::new(false);
+pub static ZDB_SCORE_TOPN_PUSHDOWN: GucSetting<ScoreTopNPushdown> =
+    GucSetting::<ScoreTopNPushdown>::new(ScoreTopNPushdown::strict);
 
 pub fn init() {
     GucRegistry::define_bool_guc("zdb.ignore_visibility",
@@ -81,6 +95,15 @@ pub fn init() {
         "ZomboDB's logging level",
         "The Postgres log level to which ZomboDB emits all of its (non-vacuum) log messages.",
         &ZDB_LOG_LEVEL,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_enum_guc(
+        "zdb.score_topn_pushdown",
+        "Automatically push ORDER BY zdb.score() DESC ... LIMIT down to Elasticsearch",
+        "When a query orders by zdb.score() DESC with a LIMIT, and nothing else can filter out rows, ZomboDB can ask Elasticsearch for only the top-N hits instead of scrolling the full result set.  'strict' requires the score to be the only sort key; 'primary' only requires it to be the first one (ties at the cutoff may then differ from the un-pushed plan).",
+        &ZDB_SCORE_TOPN_PUSHDOWN,
         GucContext::Userset,
         GucFlags::default(),
     );

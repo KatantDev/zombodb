@@ -79,3 +79,34 @@ Indicates if you have the ZomboDB Search Accelerator installed on your backing E
 
 If you do, ZomboDB is able to highly optimize certain queries, especially those that perform
 [cross-index joins](CROSS-INDEX-JOINS.md).
+
+#### `zdb.score_topn_pushdown`
+
+```
+Type: enum
+Default: strict
+Possible Values: off, strict, primary
+```
+
+Controls automatic "top-N by score" pushdown.  When a query looks like
+
+```sql
+SELECT ... FROM table WHERE table ==> 'query' ORDER BY zdb.score(ctid) DESC LIMIT n [OFFSET m]
+```
+
+and ZomboDB can prove that nothing else in the query (additional `WHERE` clauses, inner joins, `DISTINCT`,
+aggregation, etc) can remove rows between the index scan and the `LIMIT`, it automatically rewrites the query so
+Elasticsearch returns only the top `n + m` hits (sorted by `_score`) instead of scrolling the entire matching result
+set.  Postgres still applies its own sort/limit/offset on top, so the results are unchanged -- there's just
+dramatically less data pulled from Elasticsearch.
+
+- `strict`:  the pushdown only happens when `zdb.score(...) DESC` is the **only** `ORDER BY` key.  Results are always
+  identical to the un-pushed plan.
+- `primary`:  the pushdown also happens when `zdb.score(...) DESC` is the **first** of several `ORDER BY` keys
+  (eg. `ORDER BY zdb.score(ctid) DESC, popularity DESC`).  Rows with exactly equal scores at the `LIMIT` cutoff may
+  then differ from the un-pushed plan, since later sort keys only reorder ties within the top-N that Elasticsearch
+  returned.
+- `off`:  disables the feature.
+
+Queries that already use an explicit `dsl.limit()`/`dsl.offset()` are never rewritten -- the application stays in
+control.

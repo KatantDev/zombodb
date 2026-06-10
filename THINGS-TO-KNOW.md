@@ -94,6 +94,11 @@ For example, the query `SELECT * FROM table WHERE table ==> 'foo'` is rewritten 
 This is transparent to you, but is necessary in order for ZomboDB to support all of Postgres' various query plan types,
 including plans that include sequential scans and hash joins.
 
+Similarly, queries shaped like `... WHERE table ==> 'query' ORDER BY zdb.score(ctid) DESC LIMIT n` are automatically
+rewritten (when provably safe) so Elasticsearch only returns the top `n` hits instead of the full result set.  See the
+[`zdb.score_topn_pushdown`](CONFIGURATION-SETTINGS.md#zdbscore_topn_pushdown) setting for details and how to disable
+or relax this.
+
 ### ZomboDB Attaches "hidden" Triggers to Tables
 
 When you `CREATE INDEX ... ON table USING zombodb (...)` ZomboDB attaches two "hidden" triggers (they're considered
