@@ -60,6 +60,12 @@ jobs:
           context: .
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Без provenance/sbom-аттестаций: buildx по умолчанию добавляет в
+          # индекс манифесты unknown/unknown, которые докер с containerd-стором
+          # тянет отдельными запросами при pull (лишние точки отказа — ловили
+          # 502 от ghcr.io именно на attestation-манифесте).
+          provenance: false
+          sbom: false
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,scope=${{ env.PLATFORM_PAIR }},mode=max
