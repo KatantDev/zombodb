@@ -283,7 +283,9 @@ unsafe fn score_sort_varno(
         {
             return None;
         }
-        return Some((*var).varno);
+        // varno is u32 in pg13/pg14 bindings and i32 in pg15+; normalize to
+        // i32 (it's a small positive rangetable index either way)
+        return Some((*var).varno as i32);
     }
 
     None
@@ -427,7 +429,8 @@ unsafe extern "C" fn expr_scan_walker(node: *mut pg_sys::Node, context: void_mut
     } else if is_a(node, pg_sys::NodeTag::T_Var) {
         if let Some(required_varno) = context.required_varno {
             let var = node as *mut pg_sys::Var;
-            if (*var).varlevelsup == 0 && (*var).varno == required_varno {
+            // varno cast: u32 in pg13/pg14 bindings, i32 in pg15+
+            if (*var).varlevelsup == 0 && (*var).varno as i32 == required_varno {
                 context.var_count += 1;
             } else {
                 context.foreign_var_count += 1;
