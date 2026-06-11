@@ -1,0 +1,16 @@
+# build artifacts
+target/
+
+# local test Elasticsearch installation
+elasticsearch/
+
+# heavy test fixtures & docs -- not needed to compile the extension
+test/data/
+TUTORIAL-data.dmp
+docker-build-system/
+docs/
+logo.png
+
+# editor/IDE
+.idea/
+.vscode/
