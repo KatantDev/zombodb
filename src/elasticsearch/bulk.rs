@@ -233,10 +233,15 @@ impl ElasticsearchBulkRequest {
     ) -> Result<(), crossbeam::channel::SendError<BulkRequestCommand>> {
         self.handler.check_for_error();
 
-        if self.handler.prior_update.is_some() {
-            panic!("Bulk Handler already has a queued prior update tuple")
-        }
-
+        // if a prior update is still queued here, the previous UPDATE turned
+        // out to be a HOT update: PostgreSQL never called aminsert, so the
+        // queued command was never consumed by self.insert().  HOT guarantees
+        // no indexed columns changed, so the existing ES document remains
+        // valid for the whole HOT chain (visibility resolves through the
+        // heap) -- the stale command must simply be discarded.  partial
+        // indexes, the only other path that skips aminsert after an UPDATE,
+        // are rejected at CREATE INDEX time (see access_method/build.rs)
+        //
         // hold onto this, we'll use it during self.insert()
         self.handler.prior_update = Some(BulkRequestCommand::Update {
             ctid: item_pointer_to_u64(ctid),
@@ -1077,5 +1082,101 @@ fn downcast_err(e: Box<dyn Any + Send>) -> String {
     } else {
         // not a type we understand, so use a generic string
         "Box<Any>".to_string()
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use pgrx::*;
+
+    /// creates a table whose zombodb index expression depends only on the
+    /// `title` column (via an immutable function over that column), so
+    /// updates of the non-indexed `cnt` column are eligible for HOT updates
+    fn setup_hot(table: &str) {
+        Spi::run(&format!(
+            "CREATE TYPE {table}_idx_row AS (title text)"
+        ))
+        .unwrap();
+        Spi::run(&format!(
+            "CREATE FUNCTION {table}_idx_func(title text) \
+             RETURNS {table}_idx_row IMMUTABLE LANGUAGE sql AS \
+             $$ SELECT ROW($1)::{table}_idx_row $$"
+        ))
+        .unwrap();
+        Spi::run(&format!(
+            "CREATE TABLE {table} (id bigint, title text, cnt int DEFAULT 0)"
+        ))
+        .unwrap();
+        Spi::run(&format!(
+            "INSERT INTO {table} (id, title) \
+             SELECT i, 'beer ' || i FROM generate_series(1, 5) i"
+        ))
+        .unwrap();
+        Spi::run(&format!(
+            "CREATE INDEX idx{table} ON {table} \
+             USING zombodb (({table}_idx_func(title))) WITH (shards=1)"
+        ))
+        .unwrap();
+    }
+
+    /// a multi-row UPDATE of a column the index expression does not depend
+    /// on produces HOT updates: aminsert is never called, so the
+    /// `prior_update` queued by zdb_update_trigger for row N must be
+    /// discarded when the trigger fires for row N+1 (instead of panicking
+    /// with "Bulk Handler already has a queued prior update tuple")
+    #[pg_test]
+    #[initialize(es = true)]
+    fn hot_update_multi_row_non_indexed_column() {
+        setup_hot("t_hotupd");
+
+        Spi::run("UPDATE t_hotupd SET cnt = cnt + 1").unwrap();
+
+        // the documents were untouched: same count, all rows still visible
+        // through the ==> operator (visibility resolves through the HOT
+        // chain in the heap)
+        let count = Spi::get_one::<i64>(
+            "SELECT zdb.count('idxt_hotupd', '{\"match_all\":{}}'::zdbquery)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 5, "ES document count must be unchanged");
+
+        let visible = Spi::get_one::<i64>(
+            "SELECT count(*) FROM t_hotupd \
+             WHERE t_hotupd_idx_func(title) ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(visible, 5, "all rows must stay searchable");
+    }
+
+    /// a HOT update followed by a content update of the same row in the same
+    /// transaction: the stale prior_update from the HOT update is replaced
+    /// by the one from the content update, which then pairs with aminsert
+    /// normally
+    #[pg_test]
+    #[initialize(es = true)]
+    fn hot_update_then_content_update() {
+        setup_hot("t_hotmix");
+
+        Spi::run("UPDATE t_hotmix SET cnt = cnt + 1 WHERE id = 1").unwrap();
+        Spi::run("UPDATE t_hotmix SET title = 'wine 1' WHERE id = 1").unwrap();
+
+        let wine = Spi::get_one::<i64>(
+            "SELECT count(*) FROM t_hotmix \
+             WHERE t_hotmix_idx_func(title) ==> 'wine'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(wine, 1, "content update must be searchable");
+
+        let beer = Spi::get_one::<i64>(
+            "SELECT count(*) FROM t_hotmix \
+             WHERE t_hotmix_idx_func(title) ==> 'beer'",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(beer, 4, "old title must be replaced");
     }
 }
